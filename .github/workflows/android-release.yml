@@ -1,4 +1,5 @@
 name: Eta Build
+
 on:
   workflow_dispatch:
   push:
@@ -10,13 +11,24 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+
+      - name: 还原固定 debug keystore
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: eta-debug-keystore-v1
+
       - name: 打补丁
         run: bash eta-qq-payload.sh .
+
       - uses: ./.github/actions/setup-build
+
       - name: 编译
         run: ./gradlew --no-daemon --no-configuration-cache :app:compileDebugKotlin
+
       - name: 打包
         run: ./gradlew --no-daemon --no-configuration-cache :app:assembleDebug
+
       - uses: actions/upload-artifact@v4
         with:
           name: eta-debug-apk
