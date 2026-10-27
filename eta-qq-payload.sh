@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# eta-qq-payload.sh  (v2)
-# 一次写入 Eta QQ 通道全部代码（含：全工具开放、QQ 原生表情、图片表情包、握手竞态修复）
+# eta-qq-payload.sh  (v3 合并版)
+# 一次写入 Eta QQ 通道全部代码：
+#   全工具开放 / QQ原生表情 / 图片表情包 / emoji 硬过滤 / 主动搭话 / 识别图片与表情 / 握手修复
 #
 # 用法（仓库根目录）：bash eta-qq-payload.sh .
 set -euo pipefail
@@ -31,9 +32,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
 
-/**
- * QQ 通道配置：/sdcard/Android/data/io.github.mangi.eta/files/qq_channel.json
- */
+/** QQ 通道配置：/sdcard/Android/data/io.github.mangi.eta/files/qq_channel.json */
 internal data class QqChannelConfig(
     val enabled: Boolean,
     val wsUrl: String,
@@ -46,6 +45,9 @@ internal data class QqChannelConfig(
     val allowSensitiveActionTools: Boolean = false,
     val stickerDir: String = "",
     val enableStickers: Boolean = true,
+    val proactiveEnabled: Boolean = false,
+    val proactiveMinMinutes: Int = 45,
+    val proactiveMaxMinutes: Int = 150,
 ) {
     val valid: Boolean get() = enabled && wsUrl.isNotBlank() && allowedUserIds.isNotEmpty()
 
@@ -80,6 +82,9 @@ internal data class QqChannelConfig(
                     allowSensitiveActionTools = root["allowSensitiveActionTools"]?.jsonPrimitive?.booleanOrNull ?: false,
                     stickerDir = root["stickerDir"]?.jsonPrimitive?.contentOrNull.orEmpty(),
                     enableStickers = root["enableStickers"]?.jsonPrimitive?.booleanOrNull ?: true,
+                    proactiveEnabled = root["proactiveEnabled"]?.jsonPrimitive?.booleanOrNull ?: false,
+                    proactiveMinMinutes = root["proactiveMinMinutes"]?.jsonPrimitive?.intOrNull ?: 45,
+                    proactiveMaxMinutes = root["proactiveMaxMinutes"]?.jsonPrimitive?.intOrNull ?: 150,
                 )
             }.onFailure {
                 AndroidAgentLogger.warn("QqChannel config parse failed: type=${it.safeLogType()}")
@@ -104,7 +109,10 @@ internal data class QqChannelConfig(
                           "allowSensitiveReadTools": true,
                           "allowSensitiveActionTools": true,
                           "enableStickers": true,
-                          "stickerDir": ""
+                          "stickerDir": "",
+                          "proactiveEnabled": true,
+                          "proactiveMinMinutes": 45,
+                          "proactiveMaxMinutes": 150
                         }
                         """.trimIndent()
                     )
@@ -117,7 +125,7 @@ internal data class QqChannelConfig(
 }
 ETA_PAYLOAD_EOF
 
-log "写入 OneBotClient.kt（消息段支持：文本/原生表情/图片）"
+log "写入 OneBotClient.kt"
 cat > "$CHANNEL_DIR/onebot/OneBotClient.kt" <<'ETA_PAYLOAD_EOF'
 package io.github.mangi.eta.agent.channel.onebot
 
@@ -188,7 +196,6 @@ internal class OneBotClient(
         return ws.send(json.encodeToString(JsonObject.serializer(), payload))
     }
 
-    /** 发送一条消息，message 为 OneBot 消息段数组。 */
     fun sendPrivateMessage(userId: Long, segments: JsonArray): Boolean {
         if (segments.isEmpty()) return false
         return sendAction(
@@ -230,6 +237,30 @@ internal class OneBotClient(
     }
 
     companion object {
+        /** 去掉 emoji：代理对、变体选择符、零宽连接符、各类符号区一律删除。 */
+        fun stripEmoji(input: String): String {
+            val sb = StringBuilder(input.length)
+            var i = 0
+            while (i < input.length) {
+                val c = input[i]
+                val code = c.code
+                if (Character.isHighSurrogate(c) && i + 1 < input.length && Character.isLowSurrogate(input[i + 1])) {
+                    i += 2
+                    continue
+                }
+                if (code in 0xFE00..0xFE0F || code == 0x200D ||
+                    code in Int.MIN_VALUE..Int.MIN_VALUE ||
+                    code in Int.MIN_VALUE..Int.MIN_VALUE
+                ) {
+                    i++
+                    continue
+                }
+                sb.append(c)
+                i++
+            }
+            return sb.toString().replace(Regex("[ \\t]{2,}"), " ").trim()
+        }
+
         fun textSegment(text: String): JsonObject = buildJsonObject {
             put("type", "text")
             put("data", buildJsonObject { put("text", text) })
@@ -243,10 +274,6 @@ internal class OneBotClient(
         fun imageSegment(file: File): JsonObject = buildJsonObject {
             put("type", "image")
             put("data", buildJsonObject { put("file", "file://" + file.absolutePath) })
-        }
-
-        fun messageOf(vararg segments: JsonObject): JsonArray = buildJsonArray {
-            segments.forEach { add(it) }
         }
     }
 }
@@ -281,7 +308,7 @@ internal data class OneBotEvent(
 }
 ETA_PAYLOAD_EOF
 
-log "写入 QqChannelRunner.kt（全工具开放 + 表情指令注入）"
+log "写入 QqChannelRunner.kt"
 cat > "$CHANNEL_DIR/QqChannelRunner.kt" <<'ETA_PAYLOAD_EOF'
 package io.github.mangi.eta.agent.channel
 
@@ -291,7 +318,6 @@ import io.github.mangi.eta.agent.runtime.AgentRuntimeClient
 import io.github.mangi.eta.agent.runtime.AgentRuntimeWire
 import io.github.mangi.eta.core.AndroidAgentLogger
 import io.github.mangi.eta.data.repository.RuntimeConfigRepository
-import java.io.File
 import java.util.UUID
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -322,7 +348,6 @@ internal class QqChannelRunner(
         if (!acquired) return@withContext "❌ 当前无法取得前台执行资格，请稍后重试。"
 
         try {
-            // 全开：按配置放开工具；Runtime 侧 AgentRuntimePolicy 仍会与全局开关取交集
             val constrained = modelConfig.copy(
                 terminalTools = config.allowTerminalTools && modelConfig.terminalTools,
                 browserTools = modelConfig.browserTools,
@@ -352,25 +377,24 @@ internal class QqChannelRunner(
         }
     }
 
-    /** 把"怎么发表情"的说明拼在用户消息后面，模型才知道有哪些可用标记。 */
+    /** 每次运行把"怎么发表情"的说明拼在用户消息后面。 */
     private fun decorate(prompt: String): String {
         if (!config.enableStickers) return prompt
-        val faces = "0笑,1撇嘴,2色,4得意,5流泪,6害羞,9大哭,13惊讶,14调皮,17害羞,21白眼,23鄙视,25心碎,32疑问,33衰,36吐血,49拥抱,53蛋糕,66爱心,74太阳,75月亮,84炸弹,85刀,90亲亲,96汗,101鄙视,104哈欠,105酷,107右哼哼,109左哼哼,111可怜,116调皮,118抱拳,120挥手,124OK,178斜眼,182笑哭,183白眼,185飞吻,187亲,188憧憬,201点赞"
         val stickers = listStickerNames()
-        val stickerLine = if (stickers.isEmpty()) {
-            "本地表情包：暂无（跳过）"
-        } else {
-            "本地表情包可选名字：${stickers.joinToString("、")}"
-        }
         return buildString {
             append(prompt)
-            append("\n\n[发送表情的规则]\n")
-            append("- 想发 QQ 原生表情，在回复里写 [[face:ID]]，例如 [[face:14]] 是调皮，[[face:178]] 是笑哭。可选：")
-            append(faces)
-            append("\n- ")
-            append(stickerLine)
-            append("\n- 想发本地表情包，写 [[图:名字]]，名字要严格用上面列表里的词。\n")
-            append("- 一条消息最多 1 个表情，别连着发。这些标记会由程序转成真表情，不要解释它们。")
+            append("\n\n[发表情的方式]\n")
+            append("- QQ 自带表情：在回复里写 [[face:ID]]，例如 [[face:14]] 调皮、[[face:178]] 笑哭、")
+            append("[[face:21]] 白眼、[[face:111]] 可怜、[[face:66]] 爱心、[[face:0]] 微笑、[[face:201]] 点赞。\n")
+            if (stickers.isEmpty()) {
+                append("- 本地表情包：暂无。\n")
+            } else {
+                append("- 本地表情包：写 [[图:名字]]，可用名字：")
+                append(stickers.joinToString("、"))
+                append("\n")
+            }
+            append("- QQ 表情要少用：十句话里最多一两句带，一条最多 1 个，多数时候老老实实打字。\n- 可以用颜文字代替表情，比如 (｡•́︿•̀｡) (=^･ω･^=) (￣▽￣) (・_・;)，但绝对不要用 emoji。\n")
+            append("- 严禁输出任何 emoji 字符（😏🥺💢 这类），程序会直接删掉，写了也白写。")
         }
     }
 
@@ -381,13 +405,13 @@ internal class QqChannelRunner(
             ?.filter { it.isFile && it.extension.lowercase() in setOf("png", "jpg", "jpeg", "gif", "webp") }
             ?.map { it.nameWithoutExtension }
             ?.sorted()
-            ?.take(60)
+            ?.take(40)
             .orEmpty()
     }
 }
 ETA_PAYLOAD_EOF
 
-log "写入 QqChannelService.kt（消息段解析 + 表情发送 + 握手修复）"
+log "写入 QqChannelService.kt"
 cat > "$CHANNEL_DIR/QqChannelService.kt" <<'ETA_PAYLOAD_EOF'
 package io.github.mangi.eta.agent.channel
 
@@ -403,6 +427,8 @@ import io.github.mangi.eta.agent.channel.onebot.OneBotClient
 import io.github.mangi.eta.agent.channel.onebot.OneBotEvent
 import io.github.mangi.eta.core.AndroidAgentLogger
 import java.io.File
+import java.util.concurrent.ThreadLocalRandom
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -428,6 +454,18 @@ internal class QqChannelService : Service() {
 
     private val inbox = Channel<OneBotEvent>(capacity = 3)
 
+    private val cqPattern = Regex("\\[CQ:([a-zA-Z_]+)((?:,[^\\]]*)?)\\]")
+
+    private val cqFaceNames = mapOf(
+        "0" to "微笑", "1" to "撇嘴", "2" to "色", "4" to "得意", "5" to "流泪",
+        "6" to "害羞", "9" to "大哭", "13" to "惊讶", "14" to "调皮", "21" to "白眼",
+        "23" to "抠鼻", "25" to "心碎", "32" to "疑问", "36" to "吐血", "49" to "拥抱",
+        "53" to "蛋糕", "66" to "爱心", "74" to "太阳", "75" to "月亮", "84" to "炸弹",
+        "85" to "刀", "90" to "擦汗", "96" to "汗", "101" to "鄙视", "104" to "哈欠",
+        "105" to "酷", "111" to "可怜", "120" to "挥手", "124" to "OK",
+        "178" to "笑哭", "182" to "笑哭", "185" to "飞吻", "187" to "亲亲", "201" to "点赞",
+    )
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
@@ -448,6 +486,7 @@ internal class QqChannelService : Service() {
         if (running.compareAndSet(false, true)) {
             scope.launch { connectionLoop(cfg) }
             scope.launch { consumeLoop() }
+            scope.launch { proactiveLoop(cfg) }
         }
         return START_STICKY
     }
@@ -477,13 +516,11 @@ internal class QqChannelService : Service() {
             client = oneBot
             oneBot.connect()
 
-            // 先等握手完成（最多 15 秒），没连上就当本次失败
             var graceMs = 0
             while (running.get() && !oneBot.connected && graceMs < 15_000) {
                 delay(200L)
                 graceMs += 200
             }
-            // 握手成功后保持，直到断开
             while (running.get() && oneBot.connected) delay(1_000L)
 
             if (!running.get()) break
@@ -492,6 +529,36 @@ internal class QqChannelService : Service() {
             logger.info("QqChannel reconnect in ${backoffMs}ms")
             delay(backoffMs)
             backoffMs = (backoffMs * 2).coerceAtMost(60_000L)
+        }
+    }
+
+    /** 隔一段时间自己找话说：随机间隔、白天才发，避免刷屏触发风控。 */
+    private suspend fun proactiveLoop(cfg: QqChannelConfig) {
+        if (!cfg.proactiveEnabled) return
+        val target = cfg.allowedUserIds.firstOrNull() ?: return
+        val min = cfg.proactiveMinMinutes.coerceAtLeast(10)
+        val max = cfg.proactiveMaxMinutes.coerceAtLeast(min + 5)
+
+        while (running.get() && scope.isActive) {
+            val minutes = min + ThreadLocalRandom.current().nextInt(max - min + 1)
+            delay(minutes * 60_000L)
+            if (!running.get() || !scope.isActive) break
+
+            val hour = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY)
+            if (hour < 8 || hour >= 24) continue
+
+            val userRunner = runner ?: continue
+            val promptText = "现在没人跟你说话。你自己主动给哥发一条消息：" +
+                "一两句，随口找话（问他吃没吃、在干嘛、催他睡觉、吐槽自己刚遇到的小事都行）。" +
+                "不提你是程序，不解释为什么突然发消息，不重复之前说过的话。"
+            val text = runCatching {
+                userRunner.run(prompt = promptText, conversationKey = "qq:" + target)
+            }.getOrElse { "（主动消息生成失败：" + it.javaClass.simpleName + "）" }
+
+            if (text.isNotBlank() && !text.startsWith("❌")) {
+                reply(target, text)
+            }
+            delay(15 * 60_000L)
         }
     }
 
@@ -511,19 +578,65 @@ internal class QqChannelService : Service() {
     private suspend fun consumeLoop() {
         for (event in inbox) {
             val userRunner = runner ?: continue
-            val answer = userRunner.run(prompt = event.text, conversationKey = "qq:${event.userId}")
+            val prompt = transformIncoming(event.text)
+            val answer = userRunner.run(prompt = prompt, conversationKey = "qq:v2:${event.userId}")
             reply(event.userId, answer)
         }
     }
 
-    /** 把模型输出里的 [[face:ID]] / [[图:名字]] 转成真正的表情消息段。 */
+    /** 把 [CQ:xxx] 转成模型能读懂的描述；图片顺手下载到本地。 */
+    private fun transformIncoming(raw: String): String {
+        if (!raw.contains("[CQ:")) return raw
+        val dir = File(filesDir, "qq_inbox").apply { mkdirs() }
+        var index = 0
+        val text = cqPattern.replace(raw) { match ->
+            val type = match.groupValues[1]
+            val params = match.groupValues[2]
+            when (type) {
+                "face" -> {
+                    val id = Regex("id=([0-9]+)").find(params)?.groupValues?.get(1)
+                    "（发了个" + (id?.let { cqFaceNames[it] } ?: "QQ") + "表情）"
+                }
+                "mface" -> "（甩来一个表情包）"
+                "image" -> {
+                    val url = Regex("url=([^,\\]]+)").find(params)?.groupValues?.get(1)
+                    val saved = url?.let { downloadIncomingImage(it, dir, index++) }
+                    if (saved != null) {
+                        "（发了张图片，已存到 " + saved.absolutePath + "，想看就用 read_image 打开这张图）"
+                    } else {
+                        "（发了张图片，但没下载成功）"
+                    }
+                }
+                else -> ""
+            }
+        }
+        return text.replace(Regex("[ \\t]{2,}"), " ").trim()
+    }
+
+    private fun downloadIncomingImage(url: String, dir: File, index: Int): File? = runCatching {
+        val http = okhttp3.OkHttpClient.Builder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(20, TimeUnit.SECONDS)
+            .build()
+        http.newCall(okhttp3.Request.Builder().url(url).build()).execute().use { response ->
+            if (!response.isSuccessful) return@use null
+            val body = response.body ?: return@use null
+            val target = File(dir, "img_" + System.currentTimeMillis() + "_" + index + ".jpg")
+            body.byteStream().use { input ->
+                target.outputStream().use { output -> input.copyTo(output) }
+            }
+            target
+        }
+    }.getOrNull()
+
+    /** 把 [[face:ID]] / [[图:名字]] 转成真正的表情消息段，顺便把 emoji 抹掉。 */
     private fun reply(userId: Long, raw: String) {
         val cfg = config ?: return
         val oneBot = client ?: run {
             logger.warn("QqChannel reply dropped: not connected")
             return
         }
-        val batches = buildBatches(raw, cfg)
+        val batches = buildBatches(OneBotClient.stripEmoji(raw), cfg)
         for (segments in batches) {
             oneBot.sendPrivateMessage(userId, segments)
         }
@@ -547,10 +660,10 @@ internal class QqChannelService : Service() {
 
         var cursor = 0
         for (match in marker.findAll(raw)) {
-            val textBefore = raw.substring(cursor, match.range.first)
+            val before = raw.substring(cursor, match.range.first)
             cursor = match.range.last + 1
-            if (textBefore.isNotBlank()) {
-                for (chunk in textBefore.chunked(maxText)) {
+            if (before.isNotBlank()) {
+                for (chunk in before.chunked(maxText)) {
                     pending.add(OneBotClient.textSegment(chunk))
                     textLen += chunk.length
                     if (textLen >= maxText) flush()
@@ -688,4 +801,4 @@ io.open(path, 'w', encoding='utf-8').write(src)
 print('  已插入 import + 启动代码')
 PY
 
-log "完成（v2：全工具 + 原生表情 + 图片表情包 + 握手修复）"
+log "完成 v3：全工具 + 原生表情 + 图片表情包 + emoji 过滤 + 主动搭话 + 识别图片"
